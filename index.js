@@ -1244,20 +1244,32 @@ function createBot() {
 
     bot.loadPlugin(pathfinder);
 
-    // Heartbeat: log every 30s while still waiting to spawn so the user knows the bot is alive
+    // Log connection state transitions so we can see exactly where the bot gets stuck
+    addLog(`[Bot] State: CONNECTING — TCP handshake in progress`);
+
+    bot._client.once("connect", () => {
+      addLog(`[Bot] State: CONNECTED — TCP socket open, awaiting login sequence`);
+    });
+
+    bot._client.once("login", () => {
+      addLog(`[Bot] State: AUTHENTICATED — login packet received, waiting for spawn`);
+    });
+
+    // Heartbeat: log once every 30s while waiting to spawn — rate-limited to avoid log flooding
     let waitSeconds = 0;
     const connectHeartbeat = setInterval(() => {
       if (botState.connected) { clearInterval(connectHeartbeat); return; }
       waitSeconds += 30;
-      addLog(`[Bot] Still waiting for spawn... (${waitSeconds}s elapsed — Aternos may be starting up)`);
+      addLog(`[Bot] State: WAITING_FOR_SPAWN — ${waitSeconds}s elapsed (Aternos may still be starting)`);
     }, 30000);
 
-    // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
+    // Spawn timeout: if no spawn event after 5 minutes, log an error and reconnect
+    const SPAWN_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
     clearBotTimeouts();
     connectionTimeoutId = setTimeout(() => {
       clearInterval(connectHeartbeat);
       if (!botState.connected) {
-        addLog("[Bot] Connection timeout - no spawn received after 90s — retrying...");
+        addLog(`[Bot] ERROR: Spawn timeout — no spawn received after ${SPAWN_TIMEOUT_MS / 1000}s. Bot is stuck. Forcing reconnect...`);
         try {
           bot.removeAllListeners();
           bot.end();
@@ -1267,7 +1279,7 @@ function createBot() {
         bot = null;
         scheduleReconnect();
       }
-    }, 90000); // 90s - enough for Aternos to wake; retries keep trying until it does
+    }, SPAWN_TIMEOUT_MS);
 
     // FIX: guard against spawn firing twice (can happen on some servers)
     let spawnHandled = false;
@@ -1284,7 +1296,7 @@ function createBot() {
       isReconnecting = false;
 
       addLog(
-        `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
+        `[Bot] State: SPAWNED — successfully joined server! (Version: ${bot.version})`,
       );
       if (
         config.discord &&
@@ -1325,59 +1337,50 @@ function createBot() {
       });
     });
 
-    // FIX: 'kicked' fires before 'end'. Remove the scheduleReconnect from 'kicked'
-    // so that 'end' is the single source of reconnect truth, preventing double-trigger.
+    // 'kicked' fires before 'end'. Log the full reason so we can diagnose auth/ban/version issues.
+    // Do NOT call scheduleReconnect() here — 'end' fires right after and is the single reconnect trigger.
     bot.on("kicked", (reason) => {
-      // FIX: stringify reason if it's an object to make it readable in logs
       const kickReason =
         typeof reason === "object" ? JSON.stringify(reason) : reason;
-      addLog(`[Bot] Kicked: ${kickReason}`);
+      const reasonStr = String(kickReason).toLowerCase();
+
+      // Classify the kick so the log is immediately actionable
+      let kickType = "KICKED";
+      if (reasonStr.includes("outdated") || reasonStr.includes("version")) {
+        kickType = "KICKED:VERSION_MISMATCH";
+      } else if (reasonStr.includes("not authenticated") || reasonStr.includes("auth") || reasonStr.includes("premium")) {
+        kickType = "KICKED:AUTH_FAILURE";
+      } else if (reasonStr.includes("throttl") || reasonStr.includes("wait before reconnect") || reasonStr.includes("too fast")) {
+        kickType = "KICKED:THROTTLED";
+        botState.wasThrottled = true;
+        addLog("[Bot] Throttle kick detected — will use extended reconnect delay");
+      } else if (reasonStr.includes("banned") || reasonStr.includes("ban")) {
+        kickType = "KICKED:BANNED";
+      } else if (reasonStr.includes("whitelist")) {
+        kickType = "KICKED:NOT_WHITELISTED";
+      }
+
+      addLog(`[Bot] ERROR: ${kickType} — ${kickReason}`);
       botState.connected = false;
-      botState.errors.push({
-        type: "kicked",
-        reason: kickReason,
-        time: Date.now(),
-      });
+      botState.errors.push({ type: "kicked", reason: kickReason, time: Date.now() });
       clearAllIntervals();
 
-      const reasonStr = String(kickReason).toLowerCase();
-      if (
-        reasonStr.includes("throttl") ||
-        reasonStr.includes("wait before reconnect") ||
-        reasonStr.includes("too fast")
-      ) {
-        addLog(
-          "[Bot] Throttle kick detected - will use extended reconnect delay",
-        );
-        botState.wasThrottled = true;
-      }
-
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
+      if (config.discord && config.discord.events && config.discord.events.disconnect) {
         sendDiscordWebhook(`[!] **Kicked**: ${kickReason}`, 0xff0000);
       }
-      // NOTE: do NOT call scheduleReconnect() here - 'end' will fire right after 'kicked' and handle it
     });
 
-    // FIX: 'end' is the single reconnect trigger
+    // 'end' is the single reconnect trigger
     bot.on("end", (reason) => {
-      addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
+      clearInterval(connectHeartbeat); // stop heartbeat if still running
+      const endReason = reason || "unknown";
+      addLog(`[Bot] Connection ended: ${endReason}`);
       botState.connected = false;
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
 
-      if (
-        config.discord &&
-        config.discord.events &&
-        config.discord.events.disconnect
-      ) {
-        sendDiscordWebhook(
-          `[-] **Disconnected**: ${reason || "Unknown"}`,
-          0xf87171,
-        );
+      if (config.discord && config.discord.events && config.discord.events.disconnect) {
+        sendDiscordWebhook(`[-] **Disconnected**: ${endReason}`, 0xf87171);
       }
 
       // ALWAYS reconnect — bot must never leave the server
@@ -1385,10 +1388,25 @@ function createBot() {
     });
 
     bot.on("error", (err) => {
-      const msg = err.message || "";
-      addLog(`[Bot] Error: ${msg}`);
+      const msg = err.message || String(err);
+      // Classify common errors so we can see what's actually failing
+      let errType = "ERROR";
+      if (msg.includes("ECONNREFUSED")) {
+        errType = "ERROR:CONNECTION_REFUSED — server is offline or port is wrong";
+      } else if (msg.includes("ECONNRESET")) {
+        errType = "ERROR:CONNECTION_RESET — server closed the connection unexpectedly";
+      } else if (msg.includes("ETIMEDOUT") || msg.includes("timed out")) {
+        errType = "ERROR:TIMEOUT — server did not respond in time";
+      } else if (msg.includes("ENOTFOUND")) {
+        errType = "ERROR:DNS_FAILURE — hostname could not be resolved";
+      } else if (msg.includes("EPIPE")) {
+        errType = "ERROR:BROKEN_PIPE — connection dropped mid-stream";
+      } else if (msg.includes("Invalid username") || msg.includes("username")) {
+        errType = "ERROR:INVALID_USERNAME";
+      }
+      addLog(`[Bot] ${errType}: ${msg}`);
       botState.errors.push({ type: "error", message: msg, time: Date.now() });
-      // Don't reconnect on error - let 'end' event handle it
+      // Don't reconnect on error — 'end' event fires after and handles it
     });
   } catch (err) {
     addLog(`[Bot] Failed to create bot: ${err.message}`);
